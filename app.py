@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import io
@@ -26,11 +25,30 @@ with tab1:
     buffer_percentage = st.slider("Instelbare buffer (% van verkopen):", min_value=10, max_value=100, value=30, step=5)
 
     bol_file = st.file_uploader("📤 Upload Bol-export (.xlsx)", type=["xlsx"])
-    fulfilment_file = st.file_uploader("🏬 Upload Fulfilment-export (.xlsx)", type=["xlsx"])
+    # ✅ Enige wijziging onderstaand: ook CSV toestaan
+    fulfilment_file = st.file_uploader("🏬 Upload Fulfilment-export (.xlsx of .csv)", type=["xlsx", "csv"])
 
     if bol_file and fulfilment_file:
         df_bol = pd.read_excel(bol_file)
-        df_fulfilment = pd.read_excel(fulfilment_file)
+
+        # ✅ Nieuw: CSV óf XLSX kunnen inlezen voor fulfilment
+        if fulfilment_file.name.lower().endswith(".csv"):
+            try:
+                # Probeer eerst met ';' (veel gebruikt door Channeldock)
+                df_fulfilment = pd.read_csv(fulfilment_file, sep=";")
+                # Als er maar 1 kolom is, was het waarschijnlijk een comma-CSV -> nogmaals inlezen
+                if df_fulfilment.shape[1] == 1:
+                    fulfilment_file.seek(0)
+                    df_fulfilment = pd.read_csv(fulfilment_file)
+            except Exception as e:
+                st.error(f"❌ Kon CSV fulfilmentbestand niet lezen: {e}")
+                st.stop()
+        else:
+            try:
+                df_fulfilment = pd.read_excel(fulfilment_file)
+            except Exception as e:
+                st.error(f"❌ Kon Excel fulfilmentbestand niet lezen: {e}")
+                st.stop()
 
         if gebruik_14_dagen and bol_14_file:
             try:
@@ -224,7 +242,7 @@ with tab3:
         concurrent_links.append(link)
 
     if st.button("📈 Vergelijk Listings"):
-        if not eigen_link or any(not link for link in concurrent_links):
+        if not eigen_link of any(not link for link in concurrent_links):
             st.warning("Vul alle links in voordat je vergelijkt.")
         else:
             st.success("Links succesvol ontvangen! (De vergelijking volgt in de volgende versie.)")
