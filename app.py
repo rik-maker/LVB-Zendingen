@@ -3,12 +3,112 @@ import pandas as pd
 import io
 
 st.set_page_config(page_title="LVB Advies Tool", layout="wide")
-
 st.title("📦 LVB Tool met Hermeting Controle")
 
 tab1, tab2, tab3 = st.tabs(["📦 LVB Advies", "📏 Hermeting Controle", "📊 GAP Analyse"])
 
+# -----------------------------------------
+# Helpers voor fulfilment (Channeldock + oud)
+# -----------------------------------------
+def _to_numeric(s):
+    return pd.to_numeric(s, errors="coerce").fillna(0)
 
+def load_channeldock_fulfilment(file):
+    """
+    Leest Channeldock-export (CSV met ';' of XLSX) en mapt naar:
+    EAN, Vrije voorraad (Available stock), Verwachte voorraad (In delivery)
+    + optioneel extra velden voor toekomstig gebruik.
+    """
+    name = getattr(file, "name", "")
+    try:
+        if name.lower().endswith(".csv"):
+            df_raw = pd.read_csv(file, sep=";")
+        else:
+            df_raw = pd.read_excel(file)
+    except Exception as e:
+        raise ValueError(f"Kan fulfilmentbestand niet lezen: {e}")
+
+    # Kolomnamen case-insensitive benaderen
+    lc = {c.lower().strip(): c for c in df_raw.columns}
+
+    # Vereiste Channeldock-kolommen
+    col_ean = lc.get("ean")
+    col_available = lc.get("available stock")
+    col_in_delivery = lc.get("in delivery")
+
+    # Alternatieve benamingen (failsafes)
+    if col_available is None:
+        for alt in ["available_stock", "available", "free stock", "fc stock"]:
+            if alt in lc:
+                col_available = lc[alt]
+                break
+    if col_in_delivery is None:
+        for alt in ["in_delivery", "incoming", "incoming qty", "incoming quantity"]:
+            if alt in lc:
+                col_in_delivery = lc[alt]
+                break
+
+    if col_ean is None:
+        raise ValueError("Kolom 'EAN' ontbreekt in het Channeldock-bestand.")
+    if col_available is None and col_in_delivery is None:
+        raise ValueError("Kon geen voorraadkolommen vinden. Verwacht tenminste 'Available stock' of 'In delivery'.")
+
+    out = pd.DataFrame()
+    out["EAN"] = df_raw[col_ean].astype(str).str.strip()
+    out["Vrije voorraad"] = _to_numeric(df_raw[col_available]) if col_available else 0
+    out["Verwachte voorraad"] = _to_numeric(df_raw[col_in_delivery]) if col_in_delivery else 0
+
+    # (Optioneel) Extra velden – nu nog niet gebruikt in advieslogica,
+    # maar we nemen ze wel mee als je later wilt tonen:
+    # out["FC stock"] = _to_numeric(df_raw[lc.get("fc stock")]) if lc.get("fc stock") else 0
+    # out["Total stock (excl. deliveries)"] = _to_numeric(df_raw[lc.get("total stock (excl. deliveries)")]) if lc.get("total stock (excl. deliveries)") else 0
+
+    # Schoon & aggregeer op EAN (soms meerdere regels per EAN)
+    out = out.dropna(subset=["EAN"])
+    out["EAN"] = out["EAN"].str.split(",").str[0].str.strip()
+    out = out.groupby("EAN", as_index=False).agg({
+        "Vrije voorraad": "sum",
+        "Verwachte voorraad": "sum"
+    })
+    return out
+
+def try_load_fulfilment(file):
+    """
+    1) Probeer Channeldock (CSV/XLSX)
+    2) Zo niet, val terug op het oude formaat (XLSX) dat al 'Vrije voorraad'/'Verwachte voorraad' heeft.
+    Retourneert df met kolommen: EAN, Vrije voorraad, Verwachte voorraad
+    """
+    # 1) Channeldock parser
+    try:
+        return load_channeldock_fulfilment(file), "channeldock"
+    except Exception as e_cd:
+        # 2) Oude formaat fallback (reset pointer indien nodig)
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        try:
+            if file.name.lower().endswith(".csv"):
+                df = pd.read_csv(file)
+            else:
+                df = pd.read_excel(file)
+        except Exception as e_gen:
+            raise ValueError(f"Kon fulfilmentbestand niet verwerken.\nChanneldock-fout: {e_cd}\nAlgemene leesfout: {e_gen}")
+
+        needed = {"EAN", "Vrije voorraad", "Verwachte voorraad"}
+        if not needed.issubset(set(df.columns)):
+            raise ValueError(f"Bestand mist kolommen {needed}. Gevonden kolommen: {list(df.columns)}")
+
+        df = df.copy()
+        df["EAN"] = df["EAN"].astype(str).str.strip()
+        df["Vrije voorraad"] = _to_numeric(df["Vrije voorraad"])
+        df["Verwachte voorraad"] = _to_numeric(df["Verwachte voorraad"])
+        return df, "legacy"
+
+
+# -----------------------------------------
+# TAB 1 – LVB Advies
+# -----------------------------------------
 with tab1:
     wachtwoord = st.text_input("Voer wachtwoord in om verder te gaan:", type="password")
     if wachtwoord != "bhg2k25":
@@ -25,37 +125,29 @@ with tab1:
     buffer_percentage = st.slider("Instelbare buffer (% van verkopen):", min_value=10, max_value=100, value=30, step=5)
 
     bol_file = st.file_uploader("📤 Upload Bol-export (.xlsx)", type=["xlsx"])
-    # ✅ Enige wijziging onderstaand: ook CSV toestaan
-    fulfilment_file = st.file_uploader("🏬 Upload Fulfilment-export (.xlsx of .csv)", type=["xlsx", "csv"])
+    fulfilment_file = st.file_uploader("🏬 Upload Fulfilment/Channeldock-export (.csv of .xlsx)", type=["csv", "xlsx"])
 
     if bol_file and fulfilment_file:
+        # Bol inlezen – blijft hetzelfde
         df_bol = pd.read_excel(bol_file)
 
-        # ✅ Nieuw: CSV óf XLSX kunnen inlezen voor fulfilment
-        if fulfilment_file.name.lower().endswith(".csv"):
-            try:
-                # Probeer eerst met ';' (veel gebruikt door Channeldock)
-                df_fulfilment = pd.read_csv(fulfilment_file, sep=";")
-                # Als er maar 1 kolom is, was het waarschijnlijk een comma-CSV -> nogmaals inlezen
-                if df_fulfilment.shape[1] == 1:
-                    fulfilment_file.seek(0)
-                    df_fulfilment = pd.read_csv(fulfilment_file)
-            except Exception as e:
-                st.error(f"❌ Kon CSV fulfilmentbestand niet lezen: {e}")
-                st.stop()
-        else:
-            try:
-                df_fulfilment = pd.read_excel(fulfilment_file)
-            except Exception as e:
-                st.error(f"❌ Kon Excel fulfilmentbestand niet lezen: {e}")
-                st.stop()
+        # Fulfilment (Channeldock/oud) inlezen
+        try:
+            df_fulfilment, mode = try_load_fulfilment(fulfilment_file)
+            if mode == "channeldock":
+                st.info("✅ Channeldock-export herkend en succesvol ingelezen.")
+            else:
+                st.info("✅ Oud fulfilmentbestand ingelezen (legacy).")
+        except Exception as e:
+            st.error(f"❌ Fout bij verwerken van het fulfilment-/Channeldock-bestand: {e}")
+            st.stop()
 
+        # Eventueel 14-dagen verkoopcijfers overnemen
         if gebruik_14_dagen and bol_14_file:
             try:
                 df_14_raw = pd.read_excel(bol_14_file, sheet_name="Gisteren & 14 dagen", dtype=str)
-
                 if df_14_raw.shape[1] <= 8:
-                    st.error("❌ Het tabblad 'Gisteren & 14 dagen' bevat minder dan 9 kolommen. Zorg dat kolom A (EAN) en kolom I (verkopen over 14 dagen) aanwezig zijn.")
+                    st.error("❌ Het tabblad 'Gisteren & 14 dagen' bevat < 9 kolommen. Zorg dat kolom A (EAN) en kolom I (verkopen over 14 dagen) aanwezig zijn.")
                     st.stop()
 
                 df_14 = df_14_raw.iloc[:, [0, 8]].copy()
@@ -64,22 +156,24 @@ with tab1:
                 df_14["EAN"] = df_14["EAN"].astype(str)
                 df_bol = pd.merge(df_bol, df_14, on="EAN", how="left")
                 df_bol["Verkopen (Totaal)"] = df_bol["Verkopen_14"].fillna(0).astype(int)
-
             except Exception as e:
                 st.error("❌ Kan het 14-dagen Excel-bestand niet correct verwerken uit het tabblad 'Gisteren & 14 dagen'. Details: " + str(e))
                 st.stop()
 
+        # BOL kolommen normaliseren (zoals bij jou)
         df_bol["EAN"] = df_bol["EAN"].astype(str)
-        df_fulfilment["EAN"] = df_fulfilment["EAN"].astype(str)
         df_bol["Verkopen (Totaal)"] = pd.to_numeric(df_bol["Verkopen (Totaal)"], errors="coerce").fillna(0).astype(int)
         df_bol["Vrije voorraad"] = pd.to_numeric(df_bol["Vrije voorraad"], errors="coerce").fillna(0)
+        # Verzendtype uit kolom 5 (index 4) – dit was in je originele script zo
         df_bol["Verzendtype"] = df_bol.iloc[:, 4].astype(str)
 
-        def match_fulfilment(ean, voorraad_df):
-            for _, row in voorraad_df.iterrows():
-                ean_list = str(row["EAN"]).split(",")
-                if ean in [e.strip() for e in ean_list]:
-                    return row["Vrije voorraad"], row["Verwachte voorraad"]
+        # Snelle lookup op fulfilment
+        fulfil_lookup = df_fulfilment.set_index("EAN")[["Vrije voorraad", "Verwachte voorraad"]].to_dict(orient="index")
+
+        def match_fulfilment(ean):
+            row = fulfil_lookup.get(str(ean))
+            if row:
+                return row.get("Vrije voorraad", 0), row.get("Verwachte voorraad", 0)
             return 0, 0
 
         resultaten = []
@@ -90,7 +184,7 @@ with tab1:
             verkopen = row["Verkopen (Totaal)"]
             verzendtype = row["Verzendtype"]
 
-            fulfilment_vrij, fulfilment_verwacht = match_fulfilment(ean, df_fulfilment)
+            fulfilment_vrij, fulfilment_verwacht = match_fulfilment(ean)
             if fulfilment_vrij <= 0 and fulfilment_verwacht <= 0:
                 continue
 
@@ -155,32 +249,37 @@ with tab1:
 
         df_resultaat = pd.DataFrame(resultaten)
 
-        benchmark_order = {"Onvoldoende": 0, "Twijfel": 1, "Voldoende": 2}
-        df_resultaat["Benchmarkscore_sort"] = df_resultaat["Benchmarkscore"].map(benchmark_order)
-        df_resultaat.sort_values(by=["Benchmarkscore_sort", "Verzendtype"], inplace=True)
-        df_resultaat.drop(columns=["Benchmarkscore_sort"], inplace=True)
+        if df_resultaat.empty:
+            st.info("ℹ️ Geen producten met (verwachte) fulfilmentvoorraad gevonden die om actie vragen.")
+        else:
+            benchmark_order = {"Onvoldoende": 0, "Twijfel": 1, "Voldoende": 2}
+            df_resultaat["Benchmarkscore_sort"] = df_resultaat["Benchmarkscore"].map(benchmark_order)
+            df_resultaat.sort_values(by=["Benchmarkscore_sort", "Verzendtype"], inplace=True)
+            df_resultaat.drop(columns=["Benchmarkscore_sort"], inplace=True)
 
-        def kleur_op_benchmark(row):
-            if row["Benchmarkscore"] == "Onvoldoende":
-                return ["background-color: #ff3333; color: white"] * len(row)
-            elif row["Benchmarkscore"] == "Twijfel":
-                return ["background-color: #ffaa00; color: black"] * len(row)
-            elif row["Benchmarkscore"] == "Voldoende":
-                return ["background-color: #33cc33; color: white"] * len(row)
-            else:
-                return [""] * len(row)
+            def kleur_op_benchmark(row):
+                if row["Benchmarkscore"] == "Onvoldoende":
+                    return ["background-color: #ff3333; color: white"] * len(row)
+                elif row["Benchmarkscore"] == "Twijfel":
+                    return ["background-color: #ffaa00; color: black"] * len(row)
+                elif row["Benchmarkscore"] == "Voldoende":
+                    return ["background-color: #33cc33; color: white"] * len(row)
+                else:
+                    return [""] * len(row)
 
-        st.success("✅ Adviesoverzicht gegenereerd!")
-        st.dataframe(df_resultaat.style.apply(kleur_op_benchmark, axis=1), use_container_width=True)
+            st.success("✅ Adviesoverzicht gegenereerd!")
+            st.dataframe(df_resultaat.style.apply(kleur_op_benchmark, axis=1), use_container_width=True)
 
-        buffer = io.BytesIO()
-        df_resultaat.to_excel(buffer, index=False, engine='openpyxl')
-        st.download_button("📥 Download als Excel", data=buffer.getvalue(), file_name="LVB_Advies_Overzicht.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            buffer = io.BytesIO()
+            df_resultaat.to_excel(buffer, index=False, engine='openpyxl')
+            st.download_button("📥 Download als Excel", data=buffer.getvalue(), file_name="LVB_Advies_Overzicht.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        csv = df_resultaat.to_csv(index=False).encode('utf-8')
-        st.download_button("📄 Download als CSV", data=csv, file_name="LVB_Advies_Overzicht.csv", mime="text/csv")
+            csv = df_resultaat.to_csv(index=False).encode('utf-8')
+            st.download_button("📄 Download als CSV", data=csv, file_name="LVB_Advies_Overzicht.csv", mime="text/csv")
 
-
+# -----------------------------------------
+# TAB 2 – Hermeting Controle (ongewijzigd)
+# -----------------------------------------
 with tab2:
     st.subheader("📏 Hermeting Controle")
 
@@ -230,9 +329,11 @@ with tab2:
         else:
             st.info("✅ Geen afwijkingen gevonden. Alles komt overeen met je verwachte formaten.")
 
+# -----------------------------------------
+# TAB 3 – GAP Analyse (placeholder)
+# -----------------------------------------
 with tab3:
     st.header("📊 GAP Analyse Tool")
-
     st.markdown("Voer hieronder de links in van je eigen Bol.com listing en drie concurrenten om een vergelijking te maken.")
 
     eigen_link = st.text_input("🔗 Link naar jouw product")
