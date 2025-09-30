@@ -242,7 +242,7 @@ with tab3:
         concurrent_links.append(link)
 
     if st.button("📈 Vergelijk Listings"):
-        if not eigen_link of any(not link for link in concurrent_links):
+        if not eigen_link or any(not link for link in concurrent_links):
             st.warning("Vul alle links in voordat je vergelijkt.")
         else:
             st.success("Links succesvol ontvangen! (De vergelijking volgt in de volgende versie.)")
